@@ -202,5 +202,5 @@ This project is released as open source, free to use and modify.
 
 ---
 
-**Author**: [Your Name]  
-**Created**: 2024
+**Author**: 30 Sativa  
+**Created**: 2026
