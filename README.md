@@ -30,6 +30,9 @@ A real-time chat application using TCP/IP built with WPF (Windows Presentation F
 - ✅ Send messages using Enter key
 - ✅ Display connection status
 - ✅ Auto-scroll to latest messages
+- ✅ File transfer with progress tracking
+- ✅ Image sharing support
+- ✅ Voice message recording (press and hold)
 
 ## 💻 System Requirements
 
@@ -115,6 +118,20 @@ Or run the `ChatClient.exe` file in the `bin/Debug/net10.0-windows/` directory
 3. Emoji will be inserted into the input field
 4. Send message as usual
 
+### Sending Files
+
+1. Click the **"📎"** (attachment) button
+2. Select a file from your computer
+3. Progress bar will show upload status
+4. File will be sent to all connected clients
+
+### Recording Voice Messages
+
+1. Press and hold the **"🎤"** (microphone) button
+2. Record your message while holding the button
+3. Release the button to send the voice message
+4. Voice file will be sent to all connected clients
+
 ## 📁 Project Structure
 
 ```
@@ -161,7 +178,8 @@ MSG|username|message content
 **System message** (join/leave):
 ```
 [HH:mm:ss] [SYSTEM] username joined the chat
-[HH:mm:ss] [SYSTEM] username left the chat
+[HH:mm:ss] [SYSTEM] username left 
+- **NAudio**: Audio recording and playback for voice messagesthe chat
 ```
 
 ### Examples
@@ -181,7 +199,10 @@ MSG|username|message content
 
 - Server runs on port **5000** by default. Make sure this port is not blocked by firewall.
 - To chat over LAN, you need to know the IP address of the machine running the server (use `ipconfig` in CMD to view).
-- The application supports multiple clients connecting simultaneously.
+- The application supports multiple clients connecting simultaneousl
+- Downloaded files are saved to the **Documents/ChatDownloads** folder.
+- Voice messages are automatically saved with timestamp naming.
+- Images can be previewed directly in the chat interface.y.
 - Each client is handled on a separate thread to ensure no blocking.
 
 ## 🔧 Future Development
@@ -190,10 +211,11 @@ Some features that could be added in the future:
 
 - [ ] Message encryption
 - [ ] Login/registration with database
-- [ ] Message history
-- [ ] File/image sending
 - [ ] Private messaging
-- [ ] Voice chat
+- [ ] Video chat
+- [ ] Dark mode
+- [ ] Message reactions
+- [ ] User presence statust
 - [ ] Dark mode
 
 ## 📄 License
