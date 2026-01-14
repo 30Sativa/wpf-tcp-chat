@@ -11,6 +11,29 @@ namespace ChatServer
     {
         private const int ChunkSize = 64 * 1024; // 64KB chunks
 
+        private static async Task<bool> ReadExactAsync(NetworkStream stream, byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+        {
+            int total = 0;
+            while (total < count)
+            {
+                int read = await stream.ReadAsync(buffer, offset + total, count - total, cancellationToken);
+                if (read == 0) return false; // disconnected
+                total += read;
+            }
+            return true;
+        }
+
+        // Gửi 1 message text có prefix độ dài 4 byte
+        public static async Task SendTextMessageAsync(NetworkStream stream, string message, CancellationToken cancellationToken)
+        {
+            byte[] data = Encoding.UTF8.GetBytes(message);
+            byte[] lengthBytes = BitConverter.GetBytes(data.Length);
+
+            await stream.WriteAsync(lengthBytes, 0, lengthBytes.Length, cancellationToken);
+            await stream.WriteAsync(data, 0, data.Length, cancellationToken);
+            await stream.FlushAsync(cancellationToken);
+        }
+
         // Forward file từ một client đến tất cả clients khác
         public static async Task<bool> ForwardFileAsync(NetworkStream sourceStream, NetworkStream[] targetStreams, 
             string senderName, string fileName, long fileSize, bool isImage,
@@ -18,17 +41,13 @@ namespace ChatServer
         {
             try
             {
-                // Gửi file header đến tất cả target streams (như text message, không có length prefix)
+                // Gửi file header đến tất cả target streams (text message có length prefix)
                 string header = $"FILE|{senderName}|{fileName}|{fileSize}|{isImage}";
-                byte[] headerBytes = Encoding.UTF8.GetBytes(header);
-
-                // Gửi header đến tất cả targets
                 foreach (var targetStream in targetStreams)
                 {
                     try
                     {
-                        await targetStream.WriteAsync(headerBytes, 0, headerBytes.Length, cancellationToken);
-                        await targetStream.FlushAsync(cancellationToken);
+                        await SendTextMessageAsync(targetStream, header, cancellationToken);
                     }
                     catch
                     {
@@ -45,8 +64,8 @@ namespace ChatServer
 
                     // Đọc chunk size từ source
                     byte[] chunkSizeBytes = new byte[4];
-                    int bytesRead = await sourceStream.ReadAsync(chunkSizeBytes, 0, 4, cancellationToken);
-                    if (bytesRead != 4) return false;
+                    bool ok = await ReadExactAsync(sourceStream, chunkSizeBytes, 0, 4, cancellationToken);
+                    if (!ok) return false;
 
                     int chunkSize = BitConverter.ToInt32(chunkSizeBytes, 0);
                     if (chunkSize == 0) break; // End marker
@@ -75,7 +94,7 @@ namespace ChatServer
 
                     // Đọc chunk data từ source
                     byte[] chunkData = new byte[chunkSize];
-                    bytesRead = 0;
+                    int bytesRead = 0;
                     while (bytesRead < chunkSize)
                     {
                         int read = await sourceStream.ReadAsync(chunkData, bytesRead, chunkSize - bytesRead, cancellationToken);

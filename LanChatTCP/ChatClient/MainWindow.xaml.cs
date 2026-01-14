@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.IO;
@@ -12,6 +12,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media.Imaging;
+using System.Windows.Media;
 using Microsoft.Win32;
 using NAudio.Wave;
 
@@ -25,8 +26,12 @@ namespace ChatClient
         // Stream dùng để gửi / nhận dữ liệu
         private NetworkStream? _stream;
 
-        // Thread dùng để lắng nghe message từ server (tránh treo UI)
-        private Thread? _receiveThread;
+        // Task dùng để lắng nghe message từ server (tránh treo UI)
+        private Task? _receiveTask;
+        private CancellationTokenSource? _receiveCts;
+
+        // Khóa ghi để tránh interleave bytes khi nhiều tác vụ cùng gửi
+        private readonly SemaphoreSlim _sendLock = new SemaphoreSlim(1, 1);
 
         // Username hiện tại của client này
         private string? _currentUsername;
@@ -47,6 +52,8 @@ namespace ChatClient
         private DateTime _voiceRecordingStartTime;
         private System.Windows.Threading.DispatcherTimer? _voiceTimer;
         private bool _isRecordingVoice = false;
+        private MediaPlayer? _voicePlayer;
+        private MessageModel? _currentAudioMessage;
 
         public MainWindow()
         {
@@ -86,17 +93,13 @@ namespace ChatClient
                 // Lấy NetworkStream để gửi / nhận dữ liệu
                 _stream = _client.GetStream();
 
-                // Tạo thread để nhận message từ server
-                _receiveThread = new Thread(ReceiveMessage)
-                {
-                    IsBackground = true // Thread chạy nền
-                };
-                _receiveThread.Start();
+                // Tạo receive loop async (không block UI)
+                _receiveCts = new CancellationTokenSource();
+                _receiveTask = Task.Run(() => ReceiveLoopAsync(_receiveCts.Token));
 
-                // Gửi message JOIN cho server (báo user vừa vào)
+                // Gửi message JOIN cho server (báo user vừa vào) theo protocol length-prefix
                 string joinMsg = $"JOIN|{_currentUsername}";
-                byte[] joinData = Encoding.UTF8.GetBytes(joinMsg);
-                _stream.Write(joinData, 0, joinData.Length);
+                _ = SendTextMessageAsync(joinMsg, CancellationToken.None);
 
                 // Cập nhật UI sau khi connect thành công
                 btnSend.IsEnabled = true;
@@ -121,27 +124,76 @@ namespace ChatClient
             // Method này không còn được sử dụng
         }
 
+        // Gửi 1 message text có prefix độ dài 4 byte (async + có lock)
+        private async Task SendTextMessageAsync(string message, CancellationToken cancellationToken)
+        {
+            if (_stream == null) return;
+            await _sendLock.WaitAsync(cancellationToken);
+            try
+            {
+                byte[] data = Encoding.UTF8.GetBytes(message);
+                byte[] lengthBytes = BitConverter.GetBytes(data.Length);
+                await _stream.WriteAsync(lengthBytes, 0, lengthBytes.Length, cancellationToken);
+                await _stream.WriteAsync(data, 0, data.Length, cancellationToken);
+                await _stream.FlushAsync(cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                Dispatcher.Invoke(() => AddSystemMessage($"❌ Error sending message: {ex.Message}"));
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
+        }
+
+        private static async Task<bool> ReadExactAsync(NetworkStream stream, byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+        {
+            int total = 0;
+            while (total < count)
+            {
+                int read = await stream.ReadAsync(buffer, offset + total, count - total, cancellationToken);
+                if (read == 0) return false; // disconnected
+                total += read;
+            }
+            return true;
+        }
+
+        // Đọc 1 message text có prefix độ dài 4 byte (async)
+        private static async Task<string?> ReadTextMessageAsync(NetworkStream stream, CancellationToken cancellationToken)
+        {
+            byte[] lengthBytes = new byte[4];
+            bool ok = await ReadExactAsync(stream, lengthBytes, 0, 4, cancellationToken);
+            if (!ok) return null;
+
+            int length = BitConverter.ToInt32(lengthBytes, 0);
+            if (length <= 0 || length > 1024 * 1024)
+            {
+                throw new IOException($"Invalid message length received from server: {length}");
+            }
+
+            byte[] data = new byte[length];
+            ok = await ReadExactAsync(stream, data, 0, length, cancellationToken);
+            if (!ok) return null;
+
+            return Encoding.UTF8.GetString(data, 0, length);
+        }
+
         // ================= RECEIVE =================
-        // Hàm chạy trong thread để nhận message từ server
-        private void ReceiveMessage()
+        // Receive loop async: chỉ có duy nhất hàm này đọc từ _stream để tránh race condition với nhận file
+        private async Task ReceiveLoopAsync(CancellationToken cancellationToken)
         {
             try
             {
-                // Buffer dùng để đọc dữ liệu
-                byte[] buffer = new byte[8192];
-
                 while (true)
                 {
                     if (_stream == null) break;
 
-                    // Đọc dữ liệu từ stream (blocking call)
-                    int bytesRead = _stream.Read(buffer, 0, buffer.Length);
+                    // Đọc 1 message text có prefix độ dài
+                    string? msg = await ReadTextMessageAsync(_stream, cancellationToken);
 
-                    // Nếu bytesRead = 0 nghĩa là server đóng kết nối
-                    if (bytesRead == 0) break;
-
-                    // Chuyển byte sang string UTF-8
-                    string msg = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                    // Nếu null nghĩa là server đóng kết nối
+                    if (msg == null) break;
 
                     // Kiểm tra nếu là file transfer notification (từ server broadcast)
                     if (msg.StartsWith("FILE|"))
@@ -152,11 +204,27 @@ namespace ChatClient
                         {
                             string sender = parts[1];
                             string fileName = parts[2];
-                            long fileSize = long.Parse(parts[3]);
-                            bool isImage = bool.Parse(parts[4]);
 
-                            // Xử lý file transfer trong background (nhận file data từ stream)
-                            _ = Task.Run(async () => await HandleFileTransferAsync(sender, fileName, fileSize, isImage));
+                            if (!long.TryParse(parts[3], out long fileSize))
+                            {
+                                Dispatcher.Invoke(() =>
+                                {
+                                    AddSystemMessage("❌ Error receiving file: invalid file size from server.");
+                                });
+                                continue;
+                            }
+
+                            if (!bool.TryParse(parts[4], out bool isImage))
+                            {
+                                Dispatcher.Invoke(() =>
+                                {
+                                    AddSystemMessage("❌ Error receiving file: invalid image flag from server.");
+                                });
+                                continue;
+                            }
+
+                            // Xử lý file transfer bằng await (vẫn trên cùng receive loop, không tạo luồng đọc stream khác)
+                            await HandleFileTransferAsync(sender, fileName, fileSize, isImage);
                         }
                     }
                     else
@@ -221,13 +289,13 @@ namespace ChatClient
 
                         if (File.Exists(filePath))
                         {
-                            // Kiểm tra lại extension để đảm bảo GIF được nhận diện đúng
                             string extension = Path.GetExtension(filePath).ToLower();
                             bool isGifOrImage = isImage || extension == ".gif";
-                            
-                            // Nếu là ảnh hoặc GIF, dùng file path để hiển thị
-                            string displayPath = isGifOrImage ? filePath : string.Empty;
-                            AddFileMessage(senderName, fileName, fileSize, displayPath, isGifOrImage);
+                            bool isAudio = IsAudioFile(extension);
+
+                            // Hiển thị file path nếu là ảnh/GIF hoặc file audio để phát
+                            string displayPath = (isGifOrImage || isAudio) ? filePath : string.Empty;
+                            AddFileMessage(senderName, fileName, fileSize, displayPath, isGifOrImage, isAudio);
                         }
                     }
                 });
@@ -244,7 +312,7 @@ namespace ChatClient
 
         // ================= SEND =================
         // Xử lý khi bấm nút Send
-        private void Send_Click(object sender, RoutedEventArgs e)
+        private async void Send_Click(object sender, RoutedEventArgs e)
         {
             // Nếu chưa connect thì không gửi
             if (_stream == null) return;
@@ -253,12 +321,11 @@ namespace ChatClient
             string message = txtMessage.Text.Trim();
             if (string.IsNullOrEmpty(message)) return;
 
-            // Đóng gói message theo protocol: MSG|username|message
+            // Đóng gói message theo protocol: MSG|username|message (length-prefix)
             string fullMessage = $"MSG|{_currentUsername}|{message}";
-            byte[] data = Encoding.UTF8.GetBytes(fullMessage);
 
             // Gửi dữ liệu lên server
-            _stream.Write(data, 0, data.Length);
+            await SendTextMessageAsync(fullMessage, CancellationToken.None);
 
             // Hiển thị tin nhắn của mình ngay lập tức (bên phải)
             AddOwnMessage(message);
@@ -419,6 +486,7 @@ namespace ChatClient
                 string extension = fileInfo.Extension.ToLower();
                 // GIF và ảnh đều được xử lý như ảnh để hiển thị
                 bool isImage = IsImageFile(extension) || extension == ".gif";
+                bool isAudio = IsAudioFile(extension);
 
                 // Hiển thị progress bar
                 Dispatcher.Invoke(() =>
@@ -453,10 +521,11 @@ namespace ChatClient
                         // Kiểm tra lại extension để đảm bảo GIF được nhận diện đúng
                         string extension = Path.GetExtension(filePath).ToLower();
                         bool isGifOrImage = isImage || extension == ".gif";
+                        bool isVoiceAudio = isAudio || IsAudioFile(extension);
                         
-                        // Hiển thị file message trong chat (ảnh/GIF sẽ hiển thị như ảnh)
-                        string displayPath = isGifOrImage ? filePath : string.Empty;
-                        AddFileMessage(_currentUsername, fileName, fileSize, displayPath, isGifOrImage, true);
+                        // Hiển thị file message trong chat (ảnh/GIF sẽ hiển thị như ảnh, audio để play)
+                        string displayPath = (isGifOrImage || isVoiceAudio) ? filePath : string.Empty;
+                        AddFileMessage(_currentUsername, fileName, fileSize, displayPath, isGifOrImage, isVoiceAudio, true);
                     }
                     else
                     {
@@ -810,8 +879,14 @@ namespace ChatClient
             return Array.Exists(imageExtensions, ext => ext.Equals(extension, StringComparison.OrdinalIgnoreCase));
         }
 
+        private bool IsAudioFile(string extension)
+        {
+            string[] audioExtensions = { ".wav", ".mp3", ".m4a", ".aac", ".ogg", ".flac", ".wma" };
+            return Array.Exists(audioExtensions, ext => ext.Equals(extension, StringComparison.OrdinalIgnoreCase));
+        }
+
         // Thêm file message vào chat
-        private void AddFileMessage(string sender, string fileName, long fileSize, string filePath, bool isImage, bool isOwn = false)
+        private void AddFileMessage(string sender, string fileName, long fileSize, string filePath, bool isImage, bool isAudio, bool isOwn = false)
         {
             string time = DateTime.Now.ToString("HH:mm");
             
@@ -826,9 +901,27 @@ namespace ChatClient
             {
                 messageText = "📷 Image";
             }
+            else if (isAudio)
+            {
+                messageText = "🎤 Voice message";
+            }
             else
             {
                 messageText = $"📎 {fileName}";
+            }
+
+            string audioDuration = string.Empty;
+            if (isAudio && !string.IsNullOrEmpty(filePath) && File.Exists(filePath))
+            {
+                try
+                {
+                    using var reader = new AudioFileReader(filePath);
+                    audioDuration = FormatDuration(reader.TotalTime);
+                }
+                catch
+                {
+                    audioDuration = string.Empty;
+                }
             }
             
             var msgModel = new MessageModel
@@ -842,7 +935,9 @@ namespace ChatClient
                 FileName = fileName,
                 FileSize = fileSize,
                 FilePath = filePath,
-                IsImage = isImage // GIF cũng được đánh dấu là image để hiển thị
+                IsImage = isImage, // GIF cũng được đánh dấu là image để hiển thị
+                IsAudio = isAudio,
+                AudioDuration = audioDuration
             };
 
             _messages.Add(msgModel);
@@ -870,6 +965,73 @@ namespace ChatClient
                     }
                 }
             }
+        }
+
+        private void PlayVoice_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is Button btn && btn.DataContext is MessageModel msg)
+            {
+                if (string.IsNullOrEmpty(msg.FilePath) || !File.Exists(msg.FilePath))
+                {
+                    MessageBox.Show("File ghi âm không còn tồn tại trên máy.", "Không tìm thấy file", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+
+                try
+                {
+                    // Khởi tạo player nếu chưa có
+                    if (_voicePlayer == null)
+                    {
+                        _voicePlayer = new MediaPlayer();
+                        _voicePlayer.MediaEnded += VoicePlayer_MediaEnded;
+                    }
+
+                    // Nếu đang phát đúng file này thì dừng
+                    if (_currentAudioMessage == msg && msg.IsAudioPlaying)
+                    {
+                        StopAudioPlayback();
+                        return;
+                    }
+
+                    // Dừng file đang phát khác
+                    StopAudioPlayback();
+
+                    _currentAudioMessage = msg;
+                    msg.IsAudioPlaying = true;
+                    MessagesList.Items.Refresh();
+
+                    _voicePlayer.Open(new Uri(msg.FilePath));
+                    _voicePlayer.Play();
+                }
+                catch (Exception ex)
+                {
+                    StopAudioPlayback();
+                    MessageBox.Show($"Không thể phát file âm thanh: {ex.Message}", "Lỗi", MessageBoxButton.OK, MessageBoxImage.Error);
+                }
+            }
+        }
+
+        private void VoicePlayer_MediaEnded(object? sender, EventArgs e)
+        {
+            StopAudioPlayback();
+        }
+
+        private void StopAudioPlayback()
+        {
+            _voicePlayer?.Stop();
+
+            if (_currentAudioMessage != null)
+            {
+                _currentAudioMessage.IsAudioPlaying = false;
+            }
+
+            _currentAudioMessage = null;
+            MessagesList.Items.Refresh();
+        }
+
+        private string FormatDuration(TimeSpan timeSpan)
+        {
+            return $"{(int)timeSpan.TotalMinutes:D2}:{timeSpan.Seconds:D2}";
         }
 
         // ================= MESSAGE PROCESSING =================

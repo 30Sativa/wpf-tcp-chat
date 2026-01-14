@@ -10,7 +10,29 @@ namespace ChatClient
     public class FileTransferService
     {
         private const int ChunkSize = 64 * 1024; // 64KB chunks
-        private const int HeaderSize = 256; // Header size for file info
+        private static async Task<bool> ReadExactAsync(NetworkStream stream, byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+        {
+            int total = 0;
+            while (total < count)
+            {
+                int read = await stream.ReadAsync(buffer, offset + total, count - total, cancellationToken);
+                if (read == 0) return false; // disconnected
+                total += read;
+            }
+            return true;
+        }
+
+
+        // Gửi 1 message text có prefix độ dài 4 byte
+        public static async Task SendTextMessageAsync(NetworkStream stream, string message, CancellationToken cancellationToken)
+        {
+            byte[] data = Encoding.UTF8.GetBytes(message);
+            byte[] lengthBytes = BitConverter.GetBytes(data.Length);
+
+            await stream.WriteAsync(lengthBytes, 0, lengthBytes.Length, cancellationToken);
+            await stream.WriteAsync(data, 0, data.Length, cancellationToken);
+            await stream.FlushAsync(cancellationToken);
+        }
 
         // Gửi file với async/await
         public static async Task<bool> SendFileAsync(NetworkStream stream, string filePath, string senderName, 
@@ -25,13 +47,9 @@ namespace ChatClient
                 string fileExtension = fileInfo.Extension.ToLower();
                 bool isImage = IsImageFile(fileExtension);
 
-                // Gửi file header như text message: FILE|sender|filename|filesize|isImage
+                // Gửi file header như text message có length prefix: FILE|sender|filename|filesize|isImage
                 string header = $"FILE|{senderName}|{fileName}|{fileSize}|{isImage}";
-                byte[] headerBytes = Encoding.UTF8.GetBytes(header);
-                
-                // Gửi header như text message (không có length prefix)
-                await stream.WriteAsync(headerBytes, 0, headerBytes.Length, cancellationToken);
-                await stream.FlushAsync(cancellationToken);
+                await SendTextMessageAsync(stream, header, cancellationToken);
 
                 // Gửi file data theo chunks
                 using (FileStream fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read))
@@ -104,30 +122,33 @@ namespace ChatClient
                 {
                     long totalBytesReceived = 0;
 
-                    while (totalBytesReceived < fileSize)
+                    while (true)
                     {
                         cancellationToken.ThrowIfCancellationRequested();
 
                         // Đọc chunk size (4 bytes)
                         byte[] chunkSizeBytes = new byte[4];
-                        int bytesRead = await stream.ReadAsync(chunkSizeBytes, 0, 4, cancellationToken);
-                        if (bytesRead != 4) return false;
+                        bool ok = await ReadExactAsync(stream, chunkSizeBytes, 0, 4, cancellationToken);
+                        if (!ok) return false;
 
                         int chunkSize = BitConverter.ToInt32(chunkSizeBytes, 0);
-                        if (chunkSize == 0) break; // End marker
+                        if (chunkSize == 0)
+                        {
+                            // End marker từ server
+                            break;
+                        }
+
+                        // Validate chunk size
+                        if (chunkSize < 0 || chunkSize > 10 * 1024 * 1024)
+                        {
+                            System.Diagnostics.Debug.WriteLine($"Invalid chunk size received: {chunkSize}");
+                            return false;
+                        }
 
                         // Đọc chunk data
                         byte[] buffer = new byte[chunkSize];
-                        int remaining = chunkSize;
-                        int offset = 0;
-
-                        while (remaining > 0)
-                        {
-                            bytesRead = await stream.ReadAsync(buffer, offset, remaining, cancellationToken);
-                            if (bytesRead == 0) return false;
-                            remaining -= bytesRead;
-                            offset += bytesRead;
-                        }
+                        ok = await ReadExactAsync(stream, buffer, 0, chunkSize, cancellationToken);
+                        if (!ok) return false;
 
                         // Ghi chunk vào file
                         await fileStream.WriteAsync(buffer, 0, chunkSize, cancellationToken);
